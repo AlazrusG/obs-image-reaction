@@ -41,11 +41,18 @@ struct image_reaction_source {
 	bool animReset2;
 	bool loudOld;
 	bool animResetTrigger;
+	
+	// for bounce effect
+	bool bounceEnabled;
+	uint32_t bounceHeight;
+	float bounceSpeed;
+	float bounceDuration;
+	bool bounceTrigger;
+	bool bounceActive;
+	uint64_t bounceStartTime;
+	float bounceOffset;
+	uint32_t bounceTopPadding;
 };
-
-/*int MAX(int a, int b) {
-	return a > b ? a : b;
-}*/
 
 #define MIN(a,b) ((a)<(b) ? (a):(b))
 #define MAX(a,b) ((a)>(b) ? (a):(b))
@@ -118,6 +125,14 @@ static void audio_capture(void *param, obs_source_t *src, const struct audio_dat
 	
 	if (context->loud != context->loudOld)
 		context->animResetTrigger = true;
+	// for bounce effect
+	if (!context->loud) {
+		context->bounceTrigger = false;
+		context->bounceActive = false;
+		context->bounceOffset = 0.0f;
+	} else if (!context->loudOld && context->loud && context->bounceEnabled) {
+		context->bounceTrigger = true;
+	}
 }
 
 static void image_reaction_source_update(void *data, obs_data_t *settings)
@@ -131,6 +146,12 @@ static void image_reaction_source_update(void *data, obs_data_t *settings)
 	const bool linear_alpha = obs_data_get_bool(settings, "linear_alpha");
 	const float threshold = (float)obs_data_get_double(settings, "threshold");
 	const float smoothness = (float)obs_data_get_double(settings, "smoothness");
+	// for bounce effect
+	const bool bounce_enabled = obs_data_get_bool(settings, "enable_bounce");
+	const uint32_t bounce_height = (uint32_t)obs_data_get_int(settings, "bounce_height");
+	const float bounce_speed = (float)obs_data_get_double(settings, "bounce_speed");
+	const float bounce_duration = (float)obs_data_get_double(settings, "bounce_duration");
+	const uint32_t bounce_top_padding = (uint32_t)obs_data_get_int(settings, "bounce_top_padding");
 
 	if (context->file1)
 		bfree(context->file1);
@@ -147,6 +168,18 @@ static void image_reaction_source_update(void *data, obs_data_t *settings)
 	context->linear_alpha = linear_alpha;
 	context->threshold = db_to_mul(threshold);
 	context->smoothness = powf(0.1f, smoothness);
+	// for bounce effect
+	context->bounceEnabled = bounce_enabled;
+	context->bounceHeight = MAX(0, bounce_height);
+	context->bounceSpeed = MAX(0.01f, bounce_speed);
+	context->bounceDuration = MAX(0.01f, bounce_duration);
+	context->bounceTopPadding = MAX(0, bounce_top_padding);
+
+	if (!context->bounceEnabled) {
+		context->bounceTrigger = false;
+		context->bounceActive = false;
+		context->bounceOffset = 0.0f;
+	}
 
 	/* Load the image if the source is persistent or showing */
 	if (context->persistent || obs_source_showing(context->source))
@@ -194,6 +227,12 @@ static void image_reaction_source_defaults(obs_data_t *settings)
         obs_data_set_default_string(settings, "audio_source", "");
         obs_data_set_default_double(settings, "threshold", -40.0);
         obs_data_set_default_double(settings, "smoothness", 1.0);
+		// for bounce effect settings
+	obs_data_set_default_bool(settings, "enable_bounce", false);
+	obs_data_set_default_double(settings, "bounce_height", 20.0);
+	obs_data_set_default_double(settings, "bounce_speed", 1.0);
+	obs_data_set_default_double(settings, "bounce_duration", 0.35);
+	obs_data_set_default_int(settings, "bounce_top_padding", 20);
 }
 
 static void image_reaction_source_show(void *data)
@@ -267,7 +306,7 @@ static uint32_t image_reaction_source_getwidth(void *data)
 static uint32_t image_reaction_source_getheight(void *data)
 {
 	struct image_reaction_source *context = data;
-	return MAX(context->if41.image3.image2.image.cy, context->if42.image3.image2.image.cy);
+	return MAX(context->if41.image3.image2.image.cy, context->if42.image3.image2.image.cy) + context->bounceTopPadding;
 }
 
 static void image_reaction_source_render(void *data, gs_effect_t *effect)
@@ -282,12 +321,17 @@ static void image_reaction_source_render(void *data, gs_effect_t *effect)
 	gs_image_file4_t *if4 = context->loud ? &context->if42 : &context->if41;
 	if (if4->image3.image2.image.texture)
 	{
+		const float bounceOffset = (context->loud && context->bounceActive) ? context->bounceOffset : 0.0f;
+		const float baseOffset = (float)context->bounceTopPadding;
 		gs_eparam_t *const param = gs_effect_get_param_by_name(effect, "image");
 		gs_effect_set_texture_srgb(param, if4->image3.image2.image.texture);
-
+		// move with matrix translate
+		gs_matrix_push();
+		gs_matrix_translate3f(0.0f, baseOffset + bounceOffset, 0.0f);
 		gs_draw_sprite(if4->image3.image2.image.texture, 0,
 			       if4->image3.image2.image.cx,
 			       if4->image3.image2.image.cy);
+		gs_matrix_pop();
 	}
 	//context->loud = false;
 
@@ -358,7 +402,26 @@ static void image_reaction_tick(void *data, float seconds)
 			context->active = false;
 		}
 	}
+	// for bounce effect after texture update
+	if (context->bounceTrigger) {
+		context->bounceTrigger = false;
+		context->bounceActive = true;
+		context->bounceStartTime = frame_time;
+		context->bounceOffset = 0.0f;
+	}
 
+	if (context->bounceActive) {
+		uint64_t elapsed = frame_time - context->bounceStartTime;
+		float bounceProgress = ((float)elapsed / (context->bounceDuration * 1000000000.0f)) * context->bounceSpeed;
+
+		if (bounceProgress >= 1.0f) {
+			context->bounceActive = false;
+			context->bounceOffset = 0.0f;
+		} else {
+			context->bounceOffset = -sinf(bounceProgress * 3.14159265358979323846f) * context->bounceHeight; 
+		}
+	}
+	
 	for (int i = 0; i <=1; i++) {
 		gs_image_file4_t *if4 = i == 0 ? &context->if41 : &context->if42;
 		bool animReset = i == 0 ? context->animReset1 : context->animReset2;
@@ -464,6 +527,21 @@ static obs_properties_t *image_reaction_source_properties(void *data)
 	
 	obs_properties_add_float_slider(props, "smoothness",
 		obs_module_text("Smoothness"), 0.0, 5.0, 0.1);
+	// for bounce effect
+	obs_properties_add_bool(props, "enable_bounce",
+				obs_module_text("EnableBounce"));
+	obs_property_t *bounce_height = obs_properties_add_int_slider(props, "bounce_height",
+				obs_module_text("Height"), 0, 200, 1);
+	obs_property_float_set_suffix(bounce_height, " px");
+	obs_property_t *bounce_speed = obs_properties_add_float_slider(props, "bounce_speed",
+				obs_module_text("BounceSpeed"), 0.1, 5.0, 0.1);
+	obs_property_float_set_suffix(bounce_speed, "x");
+	obs_property_t *bounce_duration = obs_properties_add_float_slider(props, "bounce_duration",
+				obs_module_text("BounceDuration"), 0.05, 3.0, 0.05);
+	obs_property_float_set_suffix(bounce_duration, " s");
+	obs_property_t *bounce_top_padding = obs_properties_add_int_slider(props, "bounce_top_padding",
+				obs_module_text("TopPadding"), 0, 500, 1);
+	obs_property_int_set_suffix(bounce_top_padding, " px");
 	
 	//obs_property_set_modified_callback(src, source_changed);
 	obs_enum_sources(add_source, sources_list);
